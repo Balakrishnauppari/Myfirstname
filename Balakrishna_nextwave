@@ -1,0 +1,278 @@
+🗄️ Database Schema (database.sql)
+
+CREATE TABLE recipes (
+    id SERIAL PRIMARY KEY,
+    cuisine VARCHAR(100),
+    title VARCHAR(255),
+    rating FLOAT,
+    prep_time INT,
+    cook_time INT,
+    total_time INT,
+    description TEXT,
+    nutrients JSONB,
+    serves VARCHAR(50)
+);
+
+
+---
+
+⚙️ Backend (Node.js + Express + PostgreSQL)
+
+backend/db.js
+
+const { Pool } = require("pg");
+
+const pool = new Pool({
+  user: "postgres",
+  host: "localhost",
+  database: "recipesdb",
+  password: "password",
+  port: 5432,
+});
+
+module.exports = pool;
+
+backend/models/Recipe.js
+
+const pool = require("../db");
+
+// Helper to parse NaN -> NULL
+function parseNumber(value) {
+  if (isNaN(value) || value === "NaN") return null;
+  return Number(value);
+}
+
+async function insertRecipe(recipe) {
+  const query = `
+    INSERT INTO recipes (cuisine, title, rating, prep_time, cook_time, total_time, description, nutrients, serves)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    RETURNING *;
+  `;
+  const values = [
+    recipe.cuisine,
+    recipe.title,
+    parseNumber(recipe.rating),
+    parseNumber(recipe.prep_time),
+    parseNumber(recipe.cook_time),
+    parseNumber(recipe.total_time),
+    recipe.description,
+    recipe.nutrients,
+    recipe.serves,
+  ];
+  const res = await pool.query(query, values);
+  return res.rows[0];
+}
+
+async function getRecipes(page = 1, limit = 10) {
+  const offset = (page - 1) * limit;
+  const totalRes = await pool.query("SELECT COUNT(*) FROM recipes");
+  const total = parseInt(totalRes.rows[0].count);
+
+  const query = `
+    SELECT * FROM recipes
+    ORDER BY rating DESC NULLS LAST
+    LIMIT $1 OFFSET $2;
+  `;
+  const recipes = await pool.query(query, [limit, offset]);
+  return { total, recipes: recipes.rows };
+}
+
+async function searchRecipes(filters) {
+  let query = "SELECT * FROM recipes WHERE 1=1";
+  let values = [];
+  let idx = 1;
+
+  if (filters.title) {
+    query += ` AND LOWER(title) LIKE LOWER($${idx++})`;
+    values.push(`%${filters.title}%`);
+  }
+
+  if (filters.cuisine) {
+    query += ` AND LOWER(cuisine) = LOWER($${idx++})`;
+    values.push(filters.cuisine);
+  }
+
+  if (filters.rating) {
+    query += ` AND rating ${filters.rating.operator} $${idx++}`;
+    values.push(filters.rating.value);
+  }
+
+  if (filters.total_time) {
+    query += ` AND total_time ${filters.total_time.operator} $${idx++}`;
+    values.push(filters.total_time.value);
+  }
+
+  if (filters.calories) {
+    query += ` AND (nutrients->>'calories')::INT ${filters.calories.operator} $${idx++}`;
+    values.push(filters.calories.value);
+  }
+
+  const res = await pool.query(query, values);
+  return res.rows;
+}
+
+module.exports = { insertRecipe, getRecipes, searchRecipes };
+
+backend/routes/recipes.js
+
+const express = require("express");
+const router = express.Router();
+const { getRecipes, searchRecipes } = require("../models/Recipe");
+
+// GET all recipes (paginated, sorted by rating)
+router.get("/", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const result = await getRecipes(page, limit);
+  res.json({ page, limit, total: result.total, data: result.recipes });
+});
+
+// Search API
+router.get("/search", async (req, res) => {
+  const filters = {};
+  if (req.query.title) filters.title = req.query.title;
+  if (req.query.cuisine) filters.cuisine = req.query.cuisine;
+
+  if (req.query.rating) {
+    const match = req.query.rating.match(/(<=|>=|=|<|>)(\d+(\.\d+)?)/);
+    if (match) filters.rating = { operator: match[1], value: parseFloat(match[2]) };
+  }
+
+  if (req.query.total_time) {
+    const match = req.query.total_time.match(/(<=|>=|=|<|>)(\d+)/);
+    if (match) filters.total_time = { operator: match[1], value: parseInt(match[2]) };
+  }
+
+  if (req.query.calories) {
+    const match = req.query.calories.match(/(<=|>=|=|<|>)(\d+)/);
+    if (match) filters.calories = { operator: match[1], value: parseInt(match[2]) };
+  }
+
+  const result = await searchRecipes(filters);
+  res.json({ data: result });
+});
+
+module.exports = router;
+
+backend/app.js
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const recipesRoute = require("./routes/recipes");
+
+const app = express();
+app.use(bodyParser.json());
+
+app.use("/api/recipes", recipesRoute);
+
+app.listen(5000, () => console.log("Server running on port 5000"));
+
+
+---
+
+🎨 Frontend (React + Tailwind + shadcn/ui)
+
+frontend/src/api.js
+
+const API_URL = "http://localhost:5000/api/recipes";
+
+export async function fetchRecipes(page = 1, limit = 15) {
+  const res = await fetch(`${API_URL}?page=${page}&limit=${limit}`);
+  return res.json();
+}
+
+export async function searchRecipes(query) {
+  const res = await fetch(`${API_URL}/search?${query}`);
+  return res.json();
+}
+
+frontend/src/App.jsx
+
+import React, { useEffect, useState } from "react";
+import { fetchRecipes } from "./api";
+import RecipeTable from "./components/RecipeTable";
+import RecipeDrawer from "./components/RecipeDrawer";
+
+export default function App() {
+  const [recipes, setRecipes] = useState([]);
+  const [selected, setSelected] = useState(null);
+
+  useEffect(() => {
+    loadData(1, 15);
+  }, []);
+
+  const loadData = async (page, limit) => {
+    const res = await fetchRecipes(page, limit);
+    setRecipes(res.data);
+  };
+
+  return (
+    <div className="p-4">
+      <h1 className="text-2xl font-bold mb-4">Recipe List</h1>
+      <RecipeTable recipes={recipes} onSelect={setSelected} />
+      {selected && <RecipeDrawer recipe={selected} onClose={() => setSelected(null)} />}
+    </div>
+  );
+}
+
+frontend/src/components/RecipeTable.jsx
+
+import React from "react";
+
+export default function RecipeTable({ recipes, onSelect }) {
+  return (
+    <table className="table-auto w-full border">
+      <thead className="bg-gray-100">
+        <tr>
+          <th className="px-2 py-1">Title</th>
+          <th className="px-2 py-1">Cuisine</th>
+          <th className="px-2 py-1">Rating</th>
+          <th className="px-2 py-1">Total Time</th>
+          <th className="px-2 py-1">Serves</th>
+        </tr>
+      </thead>
+      <tbody>
+        {recipes.map((r) => (
+          <tr key={r.id} className="cursor-pointer hover:bg-gray-50" onClick={() => onSelect(r)}>
+            <td className="truncate px-2 py-1">{r.title}</td>
+            <td className="px-2 py-1">{r.cuisine}</td>
+            <td className="px-2 py-1">⭐ {r.rating}</td>
+            <td className="px-2 py-1">{r.total_time} mins</td>
+            <td className="px-2 py-1">{r.serves}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+frontend/src/components/RecipeDrawer.jsx
+
+import React from "react";
+
+export default function RecipeDrawer({ recipe, onClose }) {
+  return (
+    <div className="fixed right-0 top-0 h-full w-1/3 bg-white shadow-lg p-4 overflow-auto">
+      <button className="mb-4 text-red-500" onClick={onClose}>Close</button>
+      <h2 className="text-xl font-bold">{recipe.title}</h2>
+      <p className="text-gray-500">{recipe.cuisine}</p>
+      <hr className="my-2"/>
+      <p><strong>Description:</strong> {recipe.description}</p>
+      <p><strong>Total Time:</strong> {recipe.total_time} mins</p>
+      <p className="ml-4">Prep: {recipe.prep_time} mins | Cook: {recipe.cook_time} mins</p>
+
+      <h3 className="mt-4 font-bold">Nutrition</h3>
+      <table className="table-auto border w-full">
+        <tbody>
+          {Object.entries(recipe.nutrients || {}).map(([key, val]) => (
+            <tr key={key}>
+              <td className="border px-2 py-1">{key}</td>
+              <td className="border px-2 py-1">{val}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+

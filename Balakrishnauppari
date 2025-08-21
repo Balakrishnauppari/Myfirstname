@@ -1,0 +1,516 @@
+
+
+{
+  "name": "securin-recipes-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "NODE_ENV=development node src/index.js",
+    "start": "node src/index.js",
+    "db:create": "psql \"$PGURI\" -f sql/schema.sql",
+    "seed": "node scripts/seed.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "pg": "^8.12.0"
+  }
+}
+
+backend/.env.example
+
+PGURI=postgres://postgres:postgres@localhost:5432/recipes_db
+PORT=4000
+
+
+
+backend/sql/schema.sql
+
+CREATE TABLE IF NOT EXISTS recipes (
+  id SERIAL PRIMARY KEY,
+  cuisine VARCHAR(100),
+  title VARCHAR(255),
+  rating REAL,
+  prep_time INTEGER,
+  cook_time INTEGER,
+  total_time INTEGER,
+  description TEXT,
+  nutrients JSONB,
+  serves VARCHAR(50)
+);
+
+-- Helpful index for sorting/filtering
+CREATE INDEX IF NOT EXISTS idx_recipes_rating ON recipes (rating DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS idx_recipes_cuisine ON recipes (cuisine);
+CREATE INDEX IF NOT EXISTS idx_recipes_total_time ON recipes (total_time);
+-- Title text-search-ish index (simple btree on lower(title))
+CREATE INDEX IF NOT EXISTS idx_recipes_title_lower ON recipes ((lower(title)));
+-- Nutrients JSONB key lookup
+CREATE INDEX IF NOT EXISTS idx_recipes_nutrients_gin ON recipes USING GIN (nutrients);
+
+backend/src/db.js
+
+import dotenv from 'dotenv';
+import pkg from 'pg';
+
+dotenv.config();
+const { Pool } = pkg;
+
+export const pool = new Pool({ connectionString: process.env.PGURI });
+
+export async function query(text, params) {
+  const client = await pool.connect();
+  try {
+    const res = await client.query(text, params);
+    return res;
+  } finally {
+    client.release();
+  }
+}
+
+backend/src/utils/filters.js
+
+Utility to parse operator strings like ">=4.5", "<=120", or "=300" into SQL snippets safely.
+
+const OP_RE = /^(<=|>=|=|<|>)(.*)$/;
+
+export function parseOp(value) {
+  if (!value) return null;
+  const m = String(value).trim().match(OP_RE);
+  if (!m) return { op: '=', num: Number(value) };
+  const op = m[1];
+  const num = Number(m[2]);
+  if (Number.isNaN(num)) return null;
+  return { op, num };
+}
+
+export function buildSearchWhere({ title, cuisine, total_time, rating, calories }) {
+  const where = [];
+  const params = [];
+
+  if (title) {
+    params.push(`%${title.toLowerCase()}%`);
+    where.push(`lower(title) LIKE $${params.length}`);
+  }
+  if (cuisine) {
+    params.push(cuisine);
+    where.push(`cuisine = $${params.length}`);
+  }
+  if (total_time) {
+    const p = parseOp(total_time);
+    if (p) {
+      params.push(p.num);
+      where.push(`total_time ${p.op} $${params.length}`);
+    }
+  }
+  if (rating) {
+    const p = parseOp(rating);
+    if (p) {
+      params.push(p.num);
+      where.push(`rating ${p.op} $${params.length}`);
+    }
+  }
+  if (calories) {
+    const p = parseOp(calories);
+    if (p) {
+      // nutrients -> calories assumed key name 'calories'
+      where.push(`(nutrients->>'calories')::numeric ${p.op} $${params.length + 1}`);
+      params.push(p.num);
+    }
+  }
+
+  return { clause: where.length ? `WHERE ${where.join(' AND ')}` : '', params };
+}
+
+backend/src/routes/recipes.js
+
+import { Router } from 'express';
+import { query } from '../db.js';
+import { buildSearchWhere } from '../utils/filters.js';
+
+const router = Router();
+
+// GET /api/recipes?page=&limit=
+router.get('/', async (req, res) => {
+  try {
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 10, 1), 100);
+    const offset = (page - 1) * limit;
+
+    const countRes = await query('SELECT COUNT(*)::int AS cnt FROM recipes');
+    const total = countRes.rows[0].cnt;
+
+    const dataRes = await query(
+      `SELECT id, cuisine, title, rating, prep_time, cook_time, total_time, description, nutrients, serves
+       FROM recipes
+       ORDER BY rating DESC NULLS LAST, id ASC
+       LIMIT $1 OFFSET $2`,
+      [limit, offset]
+    );
+
+    res.json({ page, limit, total, data: dataRes.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// GET /api/recipes/search?calories=<=400&title=pie&cuisine=Italian&total_time=<=120&rating=>=4.5
+router.get('/search', async (req, res) => {
+  try {
+    const { clause, params } = buildSearchWhere(req.query);
+    const sql = `SELECT id, cuisine, title, rating, prep_time, cook_time, total_time, description, nutrients, serves
+                 FROM recipes ${clause}
+                 ORDER BY rating DESC NULLS LAST, id ASC
+                 LIMIT 200`;
+    const dataRes = await query(sql, params);
+    res.json({ data: dataRes.rows });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: 'Invalid query parameters' });
+  }
+});
+
+export default router;
+
+backend/src/index.js
+
+import express from 'express';
+import dotenv from 'dotenv';
+import cors from 'cors';
+import morgan from 'morgan';
+import recipesRouter from './routes/recipes.js';
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(morgan('dev'));
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+app.use('/api/recipes', recipesRouter);
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => console.log(`API running on http://localhost:${PORT}`));
+
+backend/scripts/seed.js
+
+Reads data/US_recipes.json, converts NaN → null, inserts into PostgreSQL.
+
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import dotenv from 'dotenv';
+import { query, pool } from '../src/db.js';
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+function nanToNull(n) { return Number.isNaN(n) ? null : n; }
+
+async function main() {
+  const jsonPath = path.resolve(__dirname, '../../data/US_recipes.json');
+  if (!fs.existsSync(jsonPath)) throw new Error('US_recipes.json not found in /data');
+
+  const raw = fs.readFileSync(jsonPath, 'utf-8');
+  const data = JSON.parse(raw);
+
+  // data may be an array or an object of records
+  const list = Array.isArray(data) ? data : Object.values(data);
+
+  console.log(`Loaded ${list.length} recipes. Inserting...`);
+
+  // Batch insert
+  const text = `INSERT INTO recipes (cuisine, title, rating, prep_time, cook_time, total_time, description, nutrients, serves)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`;
+
+  let ok = 0; let fail = 0;
+  for (const r of list) {
+    try {
+      const rating = r.rating === null || r.rating === undefined || Number.isNaN(r.rating) ? null : Number(r.rating);
+      const prep_time = r.prep_time === null || r.prep_time === undefined || Number.isNaN(r.prep_time) ? null : parseInt(r.prep_time);
+      const cook_time = r.cook_time === null || r.cook_time === undefined || Number.isNaN(r.cook_time) ? null : parseInt(r.cook_time);
+      const total_time = r.total_time === null || r.total_time === undefined || Number.isNaN(r.total_time) ? null : parseInt(r.total_time);
+
+      const params = [
+        r.cuisine ?? null,
+        r.title ?? null,
+        rating,
+        prep_time,
+        cook_time,
+        total_time,
+        r.description ?? null,
+        r.nutrients ? JSON.stringify(r.nutrients) : null,
+        r.serves ?? null
+      ];
+      await query(text, params);
+      ok++;
+    } catch (e) {
+      fail++;
+      if (fail < 5) console.warn('Failed record example:', e.message);
+    }
+  }
+
+  console.log(`Done. Inserted=${ok}, Failed=${fail}`);
+  await pool.end();
+}
+
+main().catch(err => { console.error(err); process.exit(1); });
+
+
+---
+
+2) Frontend (React + Vite + Tailwind via CDN + MUI + Axios + Rating Stars)
+
+> Uses Tailwind via CDN per instructions, Material UI for table/drawer, react-rating-stars-component for stars.
+
+
+
+frontend/package.json
+
+{
+  "name": "securin-recipes-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "axios": "^1.7.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-rating-stars-component": "^2.2.0",
+    "@mui/material": "^5.15.15",
+    "@emotion/react": "^11.13.0",
+    "@emotion/styled": "^11.13.0"
+  },
+  "devDependencies": {
+    "vite": "^5.4.0"
+  }
+}
+
+frontend/index.html
+
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Securin Recipes</title>
+    <!-- Tailwind via CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="bg-gray-50">
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+
+frontend/vite.config.js
+
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 5173,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:4000',
+        changeOrigin: true
+      }
+    }
+  }
+});
+
+frontend/src/main.jsx
+
+import React from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App'
+
+createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+)
+
+frontend/src/App.jsx
+
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
+import RecipeTable from './components/RecipeTable';
+import RecipeDrawer from './components/RecipeDrawer';
+
+export default function App() {
+  const [recipes, setRecipes] = useState([]);
+  const [page, setPage] = useState(1);
+  const [limit, setLimit] = useState(15);
+  const [total, setTotal] = useState(0);
+  const [selected, setSelected] = useState(null);
+  const [filters, setFilters] = useState({ title: '', cuisine: '', rating: '', total_time: '', calories: '' });
+  const [loading, setLoading] = useState(false);
+
+  async function fetchPage() {
+    setLoading(true);
+    try {
+      const res = await axios.get(`/api/recipes?page=${page}&limit=${limit}`);
+      setRecipes(res.data.data);
+      setTotal(res.data.total);
+    } finally { setLoading(false); }
+  }
+
+  async function search() {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams();
+      Object.entries(filters).forEach(([k,v]) => { if (v) params.set(k, v); });
+      const res = await axios.get(`/api/recipes/search?${params.toString()}`);
+      setRecipes(res.data.data);
+      setTotal(res.data.data.length);
+      setPage(1);
+    } finally { setLoading(false); }
+  }
+
+  useEffect(() => { fetchPage(); }, [page, limit]);
+
+  return (
+    <div className="p-4 max-w-7xl mx-auto">
+      <h1 className="text-2xl font-bold mb-4">Securin Recipes</h1>
+
+      {/* Filters */}
+      <div className="grid grid-cols-1 md:grid-cols-5 gap-3 mb-4">
+        <input placeholder="Title contains…" className="border p-2 rounded" value={filters.title} onChange={e=>setFilters(f=>({...f,title:e.target.value}))} />
+        <input placeholder="Cuisine (exact)" className="border p-2 rounded" value={filters.cuisine} onChange={e=>setFilters(f=>({...f,cuisine:e.target.value}))} />
+        <input placeholder="Rating (e.g. >=4.5)" className="border p-2 rounded" value={filters.rating} onChange={e=>setFilters(f=>({...f,rating:e.target.value}))} />
+        <input placeholder="Total Time (e.g. <=120)" className="border p-2 rounded" value={filters.total_time} onChange={e=>setFilters(f=>({...f,total_time:e.target.value}))} />
+        <input placeholder="Calories (e.g. <=400)" className="border p-2 rounded" value={filters.calories} onChange={e=>setFilters(f=>({...f,calories:e.target.value}))} />
+      </div>
+      <div className="flex gap-2 mb-4">
+        <button className="px-4 py-2 bg-blue-600 text-white rounded" onClick={search}>Search</button>
+        <button className="px-4 py-2 bg-gray-200 rounded" onClick={()=>{ setFilters({ title:'', cuisine:'', rating:'', total_time:'', calories:''}); fetchPage(); }}>Clear</button>
+      </div>
+
+      {/* Pagination controls */}
+      <div className="flex items-center gap-3 mb-3">
+        <button className="px-3 py-1 border rounded" disabled={page<=1} onClick={()=>setPage(p=>p-1)}>Prev</button>
+        <span>Page {page}</span>
+        <button className="px-3 py-1 border rounded" disabled={(page*limit)>=total} onClick={()=>setPage(p=>p+1)}>Next</button>
+        <select className="border p-1 rounded" value={limit} onChange={e=>setLimit(parseInt(e.target.value))}>
+          {[15,20,30,40,50].map(n=> <option key={n} value={n}>{n}/page</option>)}
+        </select>
+        <span className="text-sm text-gray-500">Total: {total}</span>
+      </div>
+
+      <RecipeTable rows={recipes} loading={loading} onSelect={setSelected} />
+      <RecipeDrawer recipe={selected} onClose={()=>setSelected(null)} />
+
+      {(!loading && recipes.length===0) && (
+        <div className="mt-6 p-4 border rounded bg-yellow-50">No results found</div>
+      )}
+    </div>
+  );
+}
+
+frontend/src/components/RecipeTable.jsx
+
+import React from 'react';
+import Rating from 'react-rating-stars-component';
+import { CircularProgress, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper } from '@mui/material';
+
+export default function RecipeTable({ rows, loading, onSelect }) {
+  return (
+    <TableContainer component={Paper}>
+      {loading && (
+        <div className="p-4"><CircularProgress size={24} /></div>
+      )}
+      <Table>
+        <TableHead>
+          <TableRow>
+            <TableCell>Title</TableCell>
+            <TableCell>Cuisine</TableCell>
+            <TableCell>Rating</TableCell>
+            <TableCell>Total Time</TableCell>
+            <TableCell>Serves</TableCell>
+          </TableRow>
+        </TableHead>
+        <TableBody>
+          {rows.map(r => (
+            <TableRow key={r.id} hover className="cursor-pointer" onClick={()=>onSelect(r)}>
+              <TableCell title={r.title}>{(r.title || '').length > 50 ? r.title.slice(0,50)+"…" : r.title}</TableCell>
+              <TableCell>{r.cuisine || '-'}</TableCell>
+              <TableCell>
+                <Rating value={r.rating || 0} edit={false} isHalf={true} size={20} />
+              </TableCell>
+              <TableCell>{r.total_time ?? '-'}</TableCell>
+              <TableCell>{r.serves ?? '-'}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </TableContainer>
+  );
+}
+
+frontend/src/components/RecipeDrawer.jsx
+
+import React from 'react';
+import { Drawer, Box } from '@mui/material';
+
+export default function RecipeDrawer({ recipe, onClose }) {
+  return (
+    <Drawer anchor="right" open={!!recipe} onClose={onClose}>
+      <Box sx={{ width: 420 }} className="p-4">
+        {!recipe ? null : (
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="text-xl font-semibold">{recipe.title}</h2>
+              <span className="text-sm bg-gray-100 px-2 py-1 rounded">{recipe.cuisine || '-'}</span>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div><span className="font-medium">Total Time:</span> {recipe.total_time ?? '-'}</div>
+              <div><span className="font-medium">Serves:</span> {recipe.serves ?? '-'}</div>
+            </div>
+            <details className="border rounded p-2 bg-gray-50">
+              <summary className="cursor-pointer">Prep & Cook Time</summary>
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <div><span className="font-medium">Prep:</span> {recipe.prep_time ?? '-'}</div>
+                <div><span className="font-medium">Cook:</span> {recipe.cook_time ?? '-'}</div>
+              </div>
+            </details>
+            {recipe.description && (
+              <div>
+                <div className="font-medium mb-1">Description</div>
+                <p className="text-sm text-gray-700 whitespace-pre-wrap">{recipe.description}</p>
+              </div>
+            )}
+            <div>
+              <div className="font-medium mb-1">Nutrients</div>
+              <table className="w-full text-sm border">
+                <tbody>
+                  {['calories','carbohydrateContent','cholesterolContent','fiberContent','proteinContent','saturatedFatContent','sodiumContent','sugarContent','fatContent']
+                    .map(key => (
+                      <tr key={key} className="border-b">
+                        <td className="p-2 w-1/2 font-medium">{key}</td>
+                        <td className="p-2">{recipe.nutrients?.[key] ?? '-'}</td>
+                      </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </Box>
+    </Drawer>
+  );
+}
+
